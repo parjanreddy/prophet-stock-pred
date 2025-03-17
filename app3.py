@@ -102,3 +102,4 @@ def main():
 # ✅ Ensure Proper Script Execution
 if __name__ == "__main__":
     main()
+fix the error while it deploying in streamlit community by using above code
