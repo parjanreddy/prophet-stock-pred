@@ -5,16 +5,71 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
-from prophet import Prophet
-import matplotlib.pyplot as plt
+import warnings
+import time
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Check for prophet availability
+try:
+    from prophet import Prophet
+    prophet_available = True
+except ImportError:
+    prophet_available = False
 
 # Suppress warnings
-import warnings
 warnings.filterwarnings("ignore")
 
 ########################
 # Utility Functions
 ########################
+
+@st.cache_data
+def fetch_stock_data(symbols, start_date, end_date, retries=3, delay=5):
+    """Fetch stock data with retries for robustness."""
+    for attempt in range(retries):
+        try:
+            data = yf.download(symbols, start=start_date, end=end_date, group_by='ticker')
+            if data.empty:
+                logger.warning(f"No data returned for {symbols}")
+                return None, None
+            
+            # Normalize DataFrame structure
+            if isinstance(symbols, str):
+                # Single symbol: return flat DataFrame
+                if isinstance(data.columns, pd.MultiIndex):
+                    data = data[symbols]
+                data = data.reset_index()
+                required_columns = ['Date', 'Open', 'High', 'Low', 'Close']
+                available_columns = [col for col in required_columns if col in data.columns]
+                if not available_columns:
+                    raise ValueError("No expected columns found in data")
+                data = data[available_columns]
+                info = yf.Ticker(symbols).info
+                return data, info
+            else:
+                # Multiple symbols: return Close prices
+                close_data = pd.DataFrame()
+                for s in symbols:
+                    if isinstance(data.columns, pd.MultiIndex) and s in data.columns.levels[0]:
+                        close_data[s] = data[s]['Close']
+                    elif s in data.columns:
+                        close_data[s] = data[s]
+                if close_data.empty:
+                    raise ValueError("No valid data found for the provided symbols")
+                close_data = close_data.reset_index()
+                info = {s: yf.Ticker(s).info for s in symbols}
+                return close_data, info
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed for {symbols}: {str(e)}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                st.error(f"Failed to fetch data for {symbols}. Error: {str(e)}")
+                return None, None
 
 def calculate_rsi(prices, period=14):
     """Calculate Relative Strength Index (RSI)."""
@@ -24,26 +79,32 @@ def calculate_rsi(prices, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def calculate_technical_indicators(df):
-    """Add common technical indicators to the DataFrame."""
-    df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    df['RSI'] = calculate_rsi(df['Close'])
+def calculate_technical_indicators(df, indicators=['SMA', 'RSI']):
+    """Add selected technical indicators to the DataFrame."""
+    df = df.copy()
+    if 'SMA' in indicators and len(df) >= 50:
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    if 'RSI' in indicators and len(df) >= 14:
+        df['RSI'] = calculate_rsi(df['Close'])
     return df
 
+@st.cache_data
 def compute_portfolio_metrics(returns, risk_free_rate=0.01):
-    """Compute portfolio metrics: annual return, volatility, Sharpe ratio, etc."""
+    """Compute portfolio metrics."""
+    if returns.empty:
+        return None
     annual_return = returns.mean() * 252
     annual_volatility = returns.std() * np.sqrt(252)
-    sharpe_ratio = (annual_return - risk_free_rate) / annual_volatility
+    sharpe_ratio = (annual_return - risk_free_rate) / annual_volatility if annual_volatility != 0 else np.nan
     negative_returns = returns[returns < 0]
-    downside_std = negative_returns.std() * np.sqrt(252)
+    downside_std = negative_returns.std() * np.sqrt(252) if not negative_returns.empty else np.nan
     sortino_ratio = (annual_return - risk_free_rate) / downside_std if downside_std != 0 else np.nan
-    var_95 = returns.quantile(0.05)
+    var_95 = returns.quantile(0.05) if not returns.empty else np.nan
     cumulative_returns = (1 + returns).cumprod()
     rolling_max = cumulative_returns.expanding().max()
     drawdown = (cumulative_returns / rolling_max) - 1
-    max_drawdown = drawdown.min()
+    max_drawdown = drawdown.min() if not drawdown.empty else np.nan
     
     return {
         'Annual Return': annual_return,
@@ -55,13 +116,21 @@ def compute_portfolio_metrics(returns, risk_free_rate=0.01):
     }
 
 def plot_portfolio_metrics(metrics_dict):
-    """Display metrics in a Streamlit-friendly format."""
-    cols = st.columns(3)
-    for i, (k, v) in enumerate(metrics_dict.items()):
-        cols[i % 3].metric(k, f"{v*100:.2f}%" if isinstance(v, float) else f"{v:.2f}")
+    """Display metrics in a table."""
+    if metrics_dict is None:
+        st.warning("Portfolio metrics unavailable due to insufficient data.")
+        return
+    metrics_df = pd.DataFrame(metrics_dict.items(), columns=["Metric", "Value"])
+    metrics_df["Value"] = metrics_df["Value"].apply(
+        lambda x: f"{x*100:.2f}%" if isinstance(x, float) and not pd.isna(x) else "N/A"
+    )
+    st.table(metrics_df)
 
-def optimize_portfolio(returns_df, num_portfolios=2000, risk_free_rate=0.01):
+@st.cache_data
+def optimize_portfolio(returns_df, num_portfolios=1000, risk_free_rate=0.01):
     """Monte Carlo approach to portfolio optimization."""
+    if returns_df.empty or len(returns_df.columns) < 1:
+        return None, None, None
     np.random.seed(42)
     num_assets = len(returns_df.columns)
     results = np.zeros((num_portfolios, 3 + num_assets))
@@ -73,27 +142,39 @@ def optimize_portfolio(returns_df, num_portfolios=2000, risk_free_rate=0.01):
         weights /= np.sum(weights)
         portfolio_return = np.sum(mean_returns * weights)
         portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility if portfolio_volatility != 0 else np.nan
         results[i, :3] = [portfolio_volatility, portfolio_return, sharpe_ratio]
         results[i, 3:] = weights
     
     columns = ['Volatility', 'Return', 'Sharpe'] + list(returns_df.columns)
     results_df = pd.DataFrame(results, columns=columns)
-    max_sharpe = results_df.iloc[results_df['Sharpe'].idxmax()]
-    min_vol = results_df.iloc[results_df['Volatility'].idxmin()]
+    max_sharpe = results_df.iloc[results_df['Sharpe'].idxmax()] if not results_df['Sharpe'].isna().all() else None
+    min_vol = results_df.iloc[results_df['Volatility'].idxmin()] if not results_df['Volatility'].isna().all() else None
     return results_df, max_sharpe, min_vol
 
 def plot_efficient_frontier(results_df, max_sharpe, min_vol):
-    """Plot the efficient frontier."""
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(results_df['Volatility'], results_df['Return'], c=results_df['Sharpe'], cmap='viridis')
-    ax.scatter(max_sharpe['Volatility'], max_sharpe['Return'], marker='*', color='r', s=300, label='Max Sharpe')
-    ax.scatter(min_vol['Volatility'], min_vol['Return'], marker='*', color='g', s=300, label='Min Volatility')
-    ax.set_xlabel('Volatility')
-    ax.set_ylabel('Return')
-    ax.legend()
-    ax.set_title("Efficient Frontier")
-    st.pyplot(fig)
+    """Plot the efficient frontier using Plotly."""
+    if results_df is None or max_sharpe is None or min_vol is None:
+        st.warning("Efficient frontier plot unavailable due to insufficient data.")
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=results_df['Volatility'], y=results_df['Return'], mode='markers',
+        marker=dict(color=results_df['Sharpe'], colorscale='Viridis'), name='Portfolios'
+    ))
+    fig.add_trace(go.Scatter(
+        x=[max_sharpe['Volatility']], y=[max_sharpe['Return']], mode='markers',
+        marker=dict(color='red', size=15, symbol='star'), name='Max Sharpe'
+    ))
+    fig.add_trace(go.Scatter(
+        x=[min_vol['Volatility']], y=[min_vol['Return']], mode='markers',
+        marker=dict(color='green', size=15, symbol='star'), name='Min Volatility'
+    ))
+    fig.update_layout(
+        title="Efficient Frontier", xaxis_title="Volatility", yaxis_title="Return",
+        showlegend=True
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 ########################
 # Main App
@@ -102,22 +183,41 @@ def plot_efficient_frontier(results_df, max_sharpe, min_vol):
 def main():
     st.set_page_config(page_title="Stock & Portfolio Analysis", layout="wide")
     st.title("📊 Stock Analysis & Portfolio Optimization")
+    st.markdown("**Note**: Run this app with `streamlit run stock_app.py` for local testing.")
+
+    # Initialize session state
+    if 'symbol' not in st.session_state:
+        st.session_state.symbol = "AAPL"
 
     # Sidebar configuration
     st.sidebar.header("Configuration")
-    symbol = st.sidebar.text_input("Enter Stock Symbol (e.g., AAPL):", "AAPL")
+    symbol = st.sidebar.text_input("Stock Symbol", value=st.session_state.symbol, key="symbol_input").upper().strip()
+    st.session_state.symbol = symbol
     start_date = st.sidebar.date_input("Start Date", datetime.now() - timedelta(days=365))
     end_date = st.sidebar.date_input("End Date", datetime.now())
+    indicators = st.sidebar.multiselect("Technical Indicators", ["SMA", "RSI"], ["SMA", "RSI"])
+    num_simulations = st.sidebar.slider("Portfolio Simulations", 500, 2000, 1000)
 
-    # Fetch data
-    st.subheader("Stock Information")
-    try:
-        stock = yf.Ticker(symbol)
-        info = stock.info
-    except Exception as e:
-        st.error(f"Failed to fetch data for {symbol}. Error: {e}")
+    # Input validation
+    if not symbol:
+        st.error("Please enter a valid stock symbol.")
+        return
+    if start_date >= end_date:
+        st.error("Start date must be before end date.")
+        return
+    if end_date > datetime.now().date():
+        st.error("End date cannot be in the future.")
         return
 
+    # Fetch single stock data
+    with st.spinner("Fetching stock data..."):
+        hist, info = fetch_stock_data(symbol, start_date, end_date)
+    if hist is None:
+        st.error(f"No data found for {symbol}. Please check the symbol or try again later.")
+        return
+
+    # Stock Information
+    st.subheader("Stock Information")
     metrics_display = {
         "Current Price": info.get('currentPrice', 'N/A'),
         "Market Cap": info.get('marketCap', 'N/A'),
@@ -125,124 +225,132 @@ def main():
         "52w High": info.get('fiftyTwoWeekHigh', 'N/A'),
         "52w Low": info.get('fiftyTwoWeekLow', 'N/A')
     }
-    cols = st.columns(5)
-    for col, (k, v) in zip(cols, metrics_display.items()):
-        col.metric(k, v)
-    st.write("**Business Summary:**")
-    st.write(info.get('longBusinessSummary', 'No information available'))
+    st.table(pd.DataFrame(metrics_display.items(), columns=["Metric", "Value"]))
+    with st.expander("Business Summary"):
+        st.write(info.get('longBusinessSummary', 'No information available'))
 
-    # Historical Data & Technicals
-    st.header("1. Technical Analysis")
-    try:
-        hist = stock.history(start=start_date, end=end_date)
-        if hist.empty:
-            st.warning("No data found for the given symbol and date range.")
-            return
-    except Exception as e:
-        st.error(f"Failed to fetch historical data. Error: {e}")
-        return
+    # Technical Analysis
+    with st.expander("1. Technical Analysis", expanded=True):
+        hist = calculate_technical_indicators(hist, indicators)
+        hist_plot = hist.iloc[::5] if len(hist) > 1000 else hist
 
-    # Candle chart
-    fig = go.Figure(go.Candlestick(
-        x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name=symbol
-    ))
-    fig.update_layout(title=f"{symbol} Price Chart", yaxis_title="Price (USD)")
-    st.plotly_chart(fig, use_container_width=True)
+        if all(col in hist_plot.columns for col in ['Open', 'High', 'Low', 'Close']):
+            fig = go.Figure(go.Candlestick(
+                x=hist_plot['Date'], open=hist_plot['Open'], high=hist_plot['High'],
+                low=hist_plot['Low'], close=hist_plot['Close'], name=symbol
+            ))
+            fig.update_layout(title=f"{symbol} Price Chart", yaxis_title="Price (USD)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Candlestick chart unavailable due to missing data columns.")
 
-    # Calculate technical indicators
-    hist = calculate_technical_indicators(hist)
+        if 'SMA' in indicators:
+            y_columns = [col for col in ['Close', 'SMA_20', 'SMA_50'] if col in hist_plot.columns and not hist_plot[col].isna().all()]
+            if y_columns:
+                fig_ma = px.line(hist_plot, x='Date', y=y_columns, title="Moving Averages")
+                st.plotly_chart(fig_ma, use_container_width=True)
+            else:
+                st.warning("Moving averages plot unavailable: insufficient data or missing columns.")
 
-    # Plot Price + SMA
-    fig_ma = go.Figure()
-    fig_ma.add_trace(go.Scatter(x=hist.index, y=hist['Close'], name="Close"))
-    fig_ma.add_trace(go.Scatter(x=hist.index, y=hist['SMA_20'], name="SMA 20"))
-    fig_ma.add_trace(go.Scatter(x=hist.index, y=hist['SMA_50'], name="SMA 50"))
-    fig_ma.update_layout(title="Moving Averages")
-    st.plotly_chart(fig_ma, use_container_width=True)
+        if 'RSI' in indicators and 'RSI' in hist_plot.columns and not hist_plot['RSI'].isna().all():
+            fig_rsi = go.Figure()
+            fig_rsi.add_trace(go.Scatter(x=hist_plot['Date'], y=hist_plot['RSI'], name="RSI"))
+            fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
+            fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+            fig_rsi.update_layout(title="Relative Strength Index")
+            st.plotly_chart(fig_rsi, use_container_width=True)
+        elif 'RSI' in indicators:
+            st.warning("RSI plot unavailable: insufficient data or missing RSI column.")
 
-    # Plot RSI
-    fig_rsi = go.Figure()
-    fig_rsi.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], name="RSI"))
-    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
-    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
-    fig_rsi.update_layout(title="Relative Strength Index")
-    st.plotly_chart(fig_rsi, use_container_width=True)
+    # Price Forecast
+    with st.expander("2. Price Forecast with Prophet"):
+        if not prophet_available:
+            st.warning("Prophet library is not installed. Please install it to enable forecasting.")
+        else:
+            try:
+                df_prophet = hist[['Date', 'Close']].reset_index(drop=True).rename(columns={"Date": "ds", "Close": "y"})
+                if pd.api.types.is_datetime64tz_dtype(df_prophet['ds']):
+                    df_prophet['ds'] = df_prophet['ds'].dt.tz_localize(None)
+                with st.spinner("Generating forecast..."):
+                    m = Prophet(daily_seasonality=True)
+                    m.fit(df_prophet)
+                    future = m.make_future_dataframe(periods=30)
+                    forecast = m.predict(future)
 
-    # Prophet Forecast
-    st.header("2. Price Forecast with Prophet")
-    df_prophet = hist[['Close']].reset_index().rename(columns={"Date": "ds", "Close": "y"})
-    if pd.api.types.is_datetime64tz_dtype(df_prophet['ds']):
-        df_prophet['ds'] = df_prophet['ds'].dt.tz_localize(None)
-    m = Prophet(daily_seasonality=True)
-    m.fit(df_prophet)
-    future = m.make_future_dataframe(periods=30)
-    forecast = m.predict(future)
-
-    fig_forecast = go.Figure()
-    fig_forecast.add_trace(go.Scatter(x=df_prophet['ds'], y=df_prophet['y'], name="Actual"))
-    fig_forecast.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], name="Forecast"))
-    fig_forecast.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_upper'], line=dict(dash='dash'), name="Upper Bound"))
-    fig_forecast.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat_lower'], line=dict(dash='dash'), name="Lower Bound"))
-    fig_forecast.update_layout(title="30-Day Price Forecast")
-    st.plotly_chart(fig_forecast, use_container_width=True)
+                fig_forecast = px.line(df_prophet, x='ds', y='y', title="30-Day Price Forecast")
+                fig_forecast.add_scatter(x=forecast['ds'], y=forecast['yhat'], name="Forecast")
+                fig_forecast.add_scatter(x=forecast['ds'], y=forecast['yhat_upper'], line=dict(dash='dash'), name="Upper Bound")
+                fig_forecast.add_scatter(x=forecast['ds'], y=forecast['yhat_lower'], line=dict(dash='dash'), name="Lower Bound")
+                st.plotly_chart(fig_forecast, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error in forecasting: {str(e)}")
 
     # Profit Estimation
-    st.header("3. Profit Estimation (Simple Buy & Hold)")
-    first_price = hist['Close'].iloc[0]
-    last_price = hist['Close'].iloc[-1]
-    profit_pct = (last_price - first_price) / first_price * 100
-    st.write(f"If you **bought {symbol}** on **{start_date}** at a price of **{first_price:.2f} USD** "
-             f"and sold on **{end_date}** at **{last_price:.2f} USD**, "
-             f"your total return would be approximately **{profit_pct:.2f}%**.")
+    with st.expander("3. Profit Estimation (Buy & Hold)"):
+        if len(hist) >= 2:
+            first_price = hist['Close'].iloc[0]
+            last_price = hist['Close'].iloc[-1]
+            profit_pct = (last_price - first_price) / first_price * 100
+            st.write(
+                f"If you **bought {symbol}** on **{start_date}** at **{first_price:.2f} USD** "
+                f"and sold on **{end_date}** at **{last_price:.2f} USD**, "
+                f"your return would be **{profit_pct:.2f}%**."
+            )
+        else:
+            st.warning("Insufficient data for profit estimation.")
 
-    # Portfolio Performance & Optimization
-    st.header("4. Portfolio Performance & Optimization")
-    other_symbols = ["MSFT", "GOOGL", "AMZN"]
-    all_symbols = [symbol] + other_symbols
-    combined_df = pd.DataFrame()
+    # Portfolio Analysis
+    with st.expander("4. Portfolio Performance & Optimization"):
+        other_symbols = ["MSFT", "GOOGL", "AMZN"]
+        all_symbols = [symbol] + other_symbols
+        with st.spinner("Fetching portfolio data..."):
+            combined_data, _ = fetch_stock_data(all_symbols, start_date, end_date)
+        if combined_data is None:
+            st.error("Failed to fetch portfolio data.")
+            return
 
-    for s in all_symbols:
-        try:
-            df_temp = yf.download(s, start=start_date, end=end_date)
-            if not df_temp.empty:
-                combined_df[s] = df_temp['Close']
-        except Exception as e:
-            st.warning(f"Could not fetch data for {s}: {str(e)}")
+        combined_df = combined_data.set_index('Date').dropna()
+        if combined_df.empty or len(combined_df) < 2:
+            st.error("No valid portfolio data available.")
+            return
 
-    if combined_df.empty:
-        st.error("Failed to fetch data for any of the selected stocks.")
-        return
+        combined_returns = combined_df.pct_change().dropna()
+        if combined_returns.empty:
+            st.error("Insufficient data for portfolio calculations.")
+            return
 
-    combined_returns = combined_df.pct_change().dropna()
-    st.write("**Portfolio Stocks:**", all_symbols)
-    st.line_chart(combined_df, use_container_width=True)
+        st.write("**Portfolio Stocks:**", all_symbols)
+        st.line_chart(combined_df, use_container_width=True)
 
-    # Portfolio Performance Metrics
-    st.subheader("Portfolio Performance Metrics")
-    equal_weights = np.array([1/len(all_symbols)] * len(all_symbols))
-    weighted_returns = combined_returns.dot(equal_weights)
-    metrics_dict = compute_portfolio_metrics(weighted_returns)
-    plot_portfolio_metrics(metrics_dict)
+        st.subheader("Portfolio Performance Metrics")
+        equal_weights = np.array([1/len(all_symbols)] * len(all_symbols))
+        weighted_returns = combined_returns.dot(equal_weights)
+        metrics_dict = compute_portfolio_metrics(weighted_returns)
+        plot_portfolio_metrics(metrics_dict)
 
-    # Portfolio Optimization
-    st.subheader("Portfolio Optimization (Monte Carlo Simulation)")
-    results_df, max_sharpe, min_vol = optimize_portfolio(combined_returns)
-    st.write("**Max Sharpe Portfolio Weights**")
-    st.write(max_sharpe[3:])
-    st.write("**Min Volatility Portfolio Weights**")
-    st.write(min_vol[3:])
-    st.write("**Efficient Frontier**")
-    plot_efficient_frontier(results_df, max_sharpe, min_vol)
+        st.subheader("Portfolio Optimization")
+        with st.spinner("Optimizing portfolio..."):
+            results_df, max_sharpe, min_vol = optimize_portfolio(combined_returns, num_portfolios=num_simulations)
+        if results_df is not None:
+            st.write("**Max Sharpe Portfolio Weights**", max_sharpe[3:] if max_sharpe is not None else "N/A")
+            st.write("**Min Volatility Portfolio Weights**", min_vol[3:] if min_vol is not None else "N/A")
+            plot_efficient_frontier(results_df, max_sharpe, min_vol)
+        else:
+            st.warning("Portfolio optimization unavailable due to insufficient data.")
 
     # Performance Evaluation
-    st.header("5. Performance Evaluation & Comparison")
-    cumulative_returns_df = (1 + combined_returns).cumprod()
-    fig_cumulative = go.Figure()
-    for col in cumulative_returns_df.columns:
-        fig_cumulative.add_trace(go.Scatter(x=cumulative_returns_df.index, y=cumulative_returns_df[col], mode='lines', name=col))
-    fig_cumulative.update_layout(title="Cumulative Returns Comparison", xaxis_title="Date", yaxis_title="Cumulative Returns (1 = 100%)")
-    st.plotly_chart(fig_cumulative, use_container_width=True)
-    st.write("**Note**: This chart helps you see how each stock performed relative to each other over time.")
+    with st.expander("5. Performance Evaluation & Comparison"):
+        if not combined_returns.empty:
+            cumulative_returns_df = (1 + combined_returns).cumprod()
+            fig_cumulative = px.line(
+                cumulative_returns_df, x=cumulative_returns_df.index, y=cumulative_returns_df.columns,
+                title="Cumulative Returns Comparison"
+            )
+            fig_cumulative.update_layout(yaxis_title="Cumulative Returns (1 = 100%)")
+            st.plotly_chart(fig_cumulative, use_container_width=True)
+            st.write("**Note**: Shows relative performance of portfolio stocks over time.")
+        else:
+            st.warning("Cumulative returns comparison unavailable due to insufficient data.")
 
 if __name__ == "__main__":
     main()
